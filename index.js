@@ -130,14 +130,35 @@ app.post("/identify", (req, res, next) => {
       body: form,
       signal: AbortSignal.timeout(30000),
     });
-    if (!response.ok) {
-      console.error(`AudD request failed (${response.status})`);
-      return res.status(502).json({ error: "Audio recognition provider failed" });
+    const responseText = await response.text();
+    let data;
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      console.error(`AudD returned a non-JSON response (${response.status})`);
+      return res.status(502).json({ error: "Audio recognition provider returned an invalid response" });
     }
 
-    const data = await response.json();
-    if (data.status !== "success") {
-      console.error("AudD rejected the recognition request");
+    if (!response.ok || data.status !== "success") {
+      const providerError =
+        typeof data.error === "object" && data.error !== null ? data.error : {};
+      const errorCode =
+        providerError.error_code ?? providerError.code ?? data.error_code ?? null;
+      const rawMessage =
+        typeof providerError.error_message === "string"
+          ? providerError.error_message
+          : typeof data.error === "string"
+            ? data.error
+            : null;
+      const errorMessage = rawMessage
+        ? rawMessage.replaceAll(apiToken, "[REDACTED]").slice(0, 300)
+        : null;
+      console.error("AudD rejected the recognition request", {
+        httpStatus: response.status,
+        providerStatus: data.status ?? null,
+        errorCode,
+        errorMessage,
+      });
       return res.status(502).json({ error: "Audio recognition provider failed" });
     }
     if (!data.result) {
