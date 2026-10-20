@@ -1,0 +1,46 @@
+# Logs & Debugging
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependency Directories (مجلدات المكتبات)
+node_modules/
+jspm_packages/
+web_modules/
+
+# Environment Variables (ملفات المفاتيح ومتغيرات البيئة - مهم جداً)
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# Operating System Files (ملفات النظام الشخصي)
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs & Code Editors (ملفات محرر الكود)
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+# Build & Output Directories (إذا كان المشروع يستخدم TypeScript أو أداة بناء)
+dist/
+build/
+out/
+
+# Temporary Files & Cache
+.cache/
+.tmp/
