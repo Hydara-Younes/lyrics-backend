@@ -91,7 +91,7 @@ function rankTrack(track, songTitle, artist, duration) {
 }
 
 app.post("/identify", (req, res, next) => {
-  console.log("identifing");
+  console.log("Audio identification request received");
   uploadAudio.single("file")(req, res, (error) => {
     if (error) {
       const status = error.code === "LIMIT_FILE_SIZE" ? 413 : 400;
@@ -107,6 +107,7 @@ app.post("/identify", (req, res, next) => {
 }, async (req, res) => {
   const apiToken = process.env.AUDD_API_TOKEN?.trim();
   if (!apiToken) {
+    console.error("AudD token is missing from the running server environment");
     return res.status(503).json({ error: "AudD is not configured on the server" });
   }
   if (!req.file) {
@@ -249,6 +250,9 @@ app.post("/lyrics", async (req, res) => {
     return res.status(502).json({ error: "Failed to connect to song search provider" });
   }
 });
-app.listen(process.env.PORT, () => {
+app.listen(port, () => {
   console.log(`Song search server is running on port ${port}`);
+  console.log(
+    `AudD token configured: ${process.env.AUDD_API_TOKEN?.trim() ? "yes" : "no"}`,
+  );
 });
