@@ -15,6 +15,7 @@ const apiKey = process.env.GEMINI_API_KEY;
 const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
 
 app.post("/lyrics", async (req, res) => {
+    console.log('reached');
   const { songTitle, mood, language } = req.body ?? {};
   if (typeof songTitle !== "string" || !songTitle.trim()) {
     return res.status(400).json({ error: "songTitle is required" });
