@@ -1,279 +1,306 @@
-const express = require("express");
-const cors = require("cors");
-const dotenv = require("dotenv");
-const multer = require("multer");
-
+const express= require('express');
+const cors= require('cors');
+const dotenv =require('dotenv');
+const app =express();
 dotenv.config();
-
-const app = express();
-const port = Number(process.env.PORT) || 3000;
-
+const PORT= process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const uploadAudio = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024, files: 1 },
-});
-
-function getNetworkErrorCode(error) {
-  let current = error;
-  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth += 1) {
-    if (typeof current.code === "string") return current.code;
-    current = current.cause;
-  }
-  return null;
-}
-
-function normalize(value) {
-  return typeof value === "string"
-    ? value
-        .normalize("NFKD")
-        .replace(/\p{M}/gu, "")
-        .toLocaleLowerCase()
-        .replace(/[^\p{L}\p{N}]+/gu, " ")
-        .trim()
-    : "";
-}
-
-function editSimilarity(left, right) {
-  if (!left || !right) return 0;
-  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
-
-  for (let row = 1; row <= left.length; row += 1) {
-    let diagonal = previous[0];
-    previous[0] = row;
-    for (let column = 1; column <= right.length; column += 1) {
-      const above = previous[column];
-      previous[column] = Math.min(
-        previous[column] + 1,
-        previous[column - 1] + 1,
-        diagonal + (left[row - 1] === right[column - 1] ? 0 : 1),
-      );
-      diagonal = above;
-    }
-  }
-
-  return 1 - previous[right.length] / Math.max(left.length, right.length);
-}
-
-function tokenSimilarity(left, right) {
-  const leftTokens = new Set(left.split(" ").filter(Boolean));
-  const rightTokens = new Set(right.split(" ").filter(Boolean));
-  if (!leftTokens.size || !rightTokens.size) return 0;
-  const overlap = [...leftTokens].filter((token) => rightTokens.has(token)).length;
-  return (2 * overlap) / (leftTokens.size + rightTokens.size);
+function normalizeText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
 }
 
 function textSimilarity(left, right) {
-  const normalizedLeft = normalize(left);
-  const normalizedRight = normalize(right);
-  if (normalizedLeft === normalizedRight) return 1;
-  return Math.max(
-    editSimilarity(normalizedLeft, normalizedRight),
-    tokenSimilarity(normalizedLeft, normalizedRight),
-  );
+  const leftText = normalizeText(left);
+  const rightText = normalizeText(right);
+  if (!leftText || !rightText) return 0;
+  if (leftText === rightText) return 1;
+
+  const leftWords = new Set(leftText.split(/\s+/));
+  const rightWords = new Set(rightText.split(/\s+/));
+  const overlap = [...leftWords].filter((word) => rightWords.has(word)).length;
+
+  return (2 * overlap) / (leftWords.size + rightWords.size);
 }
 
-function rankTrack(track, songTitle, artist, duration) {
-  const titleScore = textSimilarity(track.trackName, songTitle);
+function rankTrack(track, title, artist, duration) {
+  const titleScore = textSimilarity(track.trackName, title);
   const artistScore = textSimilarity(track.artistName, artist);
   const durationScore =
-    Number.isFinite(duration) && duration > 0 && Number.isFinite(track.duration)
-      ? Math.max(0, 1 - Math.abs(track.duration - duration) / 30)
-      : 0.5;
+    duration && Number.isFinite(track.duration) && track.duration > 0
+      ? Math.max(
+          0,
+          1 - Math.abs(track.duration - duration) / Math.max(track.duration, duration)
+        )
+      : 0;
 
   return {
     titleScore,
     artistScore,
-    score: titleScore * 0.65 + artistScore * 0.3 + durationScore * 0.05,
+    score:
+      titleScore * 0.55 +
+      artistScore * 0.4 +
+      (duration ? durationScore * 0.05 : 0),
   };
 }
 
-app.post("/identify", (req, res, next) => {
-  console.log("Audio identification request received");
-  uploadAudio.single("file")(req, res, (error) => {
-    if (error) {
-      const status = error.code === "LIMIT_FILE_SIZE" ? 413 : 400;
-      return res.status(status).json({
-        error:
-          status === 413
-            ? "Audio file exceeds the 20 MB upload limit"
-            : "Invalid audio upload",
-      });
-    }
-    next();
+function hasLyrics(track) {
+  return Boolean(
+    (typeof track.syncedLyrics === "string" && track.syncedLyrics.trim()) ||
+    (typeof track.plainLyrics === "string" && track.plainLyrics.trim())
+  );
+}
+
+function toMetadata(track, score) {
+  return {
+    title: track.trackName,
+    artist: track.artistName,
+    album: track.albumName || "",
+    duration: Number.isFinite(track.duration) ? track.duration : null,
+    matchPercent: Math.round(score * 100),
+  };
+}
+
+/**
+ * Queries the LRCLIB search endpoint.
+ * Throws on network/timeout problems and on unexpected HTTP errors.
+ */
+async function searchLrclib(params) {
+  const response = await fetch(`https://lrclib.net/api/search?${params.toString()}`, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "OfflineMusicPlayer/1.0",
+    },
+    signal: AbortSignal.timeout(15000),
   });
-}, async (req, res) => {
-  const apiToken = process.env.AUDD_API_TOKEN?.trim();
-  if (!apiToken) {
-    console.error("AudD token is missing from the running server environment");
-    return res.status(503).json({ error: "AudD is not configured on the server" });
-  }
-  if (!req.file) {
-    return res.status(400).json({ error: "Audio file is required" });
+
+  if (!response.ok) {
+    const error = new Error(`LRCLIB returned HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
 
-  try {
-    const form = new FormData();
-    form.append("api_token", apiToken);
-    form.append("return", "apple_music,spotify");
-    form.append(
-      "file",
-      new Blob([req.file.buffer], { type: req.file.mimetype || "application/octet-stream" }),
-      req.file.originalname || "audio-upload",
-    );
+  const results = await response.json();
 
-    const response = await fetch("https://api.audd.io/", {
-      method: "POST",
-
-      body: form,
-      signal: AbortSignal.timeout(30000),
-    });
-    const responseText = await response.text();
-    let data;
-    try {
-      data = JSON.parse(responseText);
-    } catch {
-      console.error(`AudD returned a non-JSON response (${response.status})`);
-      return res.status(502).json({ error: "Audio recognition provider returned an invalid response" });
-    }
-
-    if (!response.ok || data.status !== "success") {
-      const providerError =
-        typeof data.error === "object" && data.error !== null ? data.error : {};
-      const errorCode =
-        providerError.error_code ?? providerError.code ?? data.error_code ?? null;
-      const rawMessage =
-        typeof providerError.error_message === "string"
-          ? providerError.error_message
-          : typeof data.error === "string"
-            ? data.error
-            : null;
-      const errorMessage = rawMessage
-        ? rawMessage.replaceAll(apiToken, "[REDACTED]").slice(0, 300)
-        : null;
-      console.error("AudD rejected the recognition request", {
-        httpStatus: response.status,
-        providerStatus: data.status ?? null,
-        errorCode,
-        errorMessage,
-      });
-      return res.status(502).json({ error: "Audio recognition provider failed" });
-    }
-    if (!data.result) {
-      return res.json({ identified: false, track: null });
-    }
-
-    const result = data.result;
-    if (
-      typeof result.title !== "string" ||
-      !result.title.trim() ||
-      typeof result.artist !== "string" ||
-      !result.artist.trim()
-    ) {
-      return res.status(502).json({ error: "Audio recognition returned incomplete metadata" });
-    }
-
-    return res.json({
-      identified: true,
-      track: {
-        title: result.title.trim(),
-        artist: result.artist.trim(),
-        album: typeof result.album === "string" ? result.album : "",
-        isrc:
-          (typeof result.isrc === "string" && result.isrc) ||
-          (typeof result.apple_music?.isrc === "string" && result.apple_music.isrc) ||
-          (typeof result.spotify?.external_ids?.isrc === "string" &&
-            result.spotify.external_ids.isrc) ||
-          null,
-      },
-    });
-  } catch (error) {
-    if (error.name === "TimeoutError" || error.name === "AbortError") {
-      console.error("AudD recognition request timed out");
-      return res.status(504).json({ error: "Audio recognition timed out" });
-    }
-    const networkErrorCode = getNetworkErrorCode(error);
-    if (
-      [
-        "UND_ERR_CONNECT_TIMEOUT",
-        "ETIMEDOUT",
-        "ECONNREFUSED",
-        "ECONNRESET",
-        "ENOTFOUND",
-        "EAI_AGAIN",
-        "EHOSTUNREACH",
-        "ENETUNREACH",
-      ].includes(networkErrorCode)
-    ) {
-      console.error(`Backend cannot reach AudD (${networkErrorCode})`);
-      return res.status(503).json({
-        error: "Backend cannot reach AudD. Check outbound HTTPS connectivity or firewall settings.",
-      });
-    }
-    console.error("Audio recognition request failed:", error);
-    return res.status(502).json({ error: "Could not connect to audio recognition provider" });
+  if (!Array.isArray(results)) {
+    throw new Error("LRCLIB returned an invalid response");
   }
-});
+
+  return results;
+}
+
+async function fetchLyricsOvh(artist, title) {
+  const url =
+    `https://api.lyrics.ovh/v1/` +
+    `${encodeURIComponent(artist)}/` +
+    `${encodeURIComponent(title)}`;
+
+  const response = await fetch(url, {
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (response.status === 404) {
+    return { status: "not_found", lyrics: null };
+  }
+
+  if (!response.ok) {
+    throw new Error(`Lyrics.ovh returned HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+
+  if (typeof data.lyrics !== "string" || !data.lyrics.trim()) {
+    return { status: "not_found", lyrics: null };
+  }
+
+  return {
+    status: "found",
+    lyrics: data.lyrics.trim(),
+  };
+}
 
 app.post("/lyrics", async (req, res) => {
-  console.log("here we go");
+  console.log('reached');
   const { songTitle, artist, duration } = req.body ?? {};
+
   if (typeof songTitle !== "string" || !songTitle.trim()) {
     return res.status(400).json({ error: "songTitle is required" });
   }
-  if (typeof artist !== "string" || !artist.trim()) {
-    return res.status(400).json({ error: "artist is required" });
-  }
 
-  const params = new URLSearchParams({
-    track_name: songTitle.trim(),
-    artist_name: artist.trim(),
-  });
+  const title = songTitle.trim();
+  // The artist is optional: when it is missing the lookup falls back to a
+  // title-only search (useful when the file's artist tag is wrong).
+  const artistName = typeof artist === "string" ? artist.trim() : "";
 
+  const numericDuration = Number(duration);
+  const trackDuration =
+    duration !== undefined &&
+    duration !== null &&
+    duration !== "" &&
+    Number.isFinite(numericDuration) &&
+    numericDuration > 0
+      ? numericDuration
+      : undefined;
+
+  const providerUrl =
+    `https://www.musixmatch.com/search/` +
+    encodeURIComponent(`${artistName} ${title}`.trim());
+
+  let lrclibAvailable = false;
+  let lrclibMatch = null;
+  let tracks = [];
+
+  // --------------------------------------------------
+  // 1. Search LRCLIB with the exact track + artist.
+  // --------------------------------------------------
   try {
-    const response = await fetch(`https://lrclib.net/api/search?${params}`, {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!response.ok) {
-      console.error(`Lyrics metadata search failed (${response.status})`);
-      return res.status(502).json({ error: "Song search provider failed" });
-    }
+    const params = new URLSearchParams();
+    params.set("track_name", title);
+    if (artistName) params.set("artist_name", artistName);
 
-    const results = await response.json();
-    const ranked = (Array.isArray(results) ? results : [])
-      .map((track) => ({ track, ...rankTrack(track, songTitle, artist, duration) }))
-      .filter(({ titleScore, artistScore }) => titleScore >= 0.35 && artistScore >= 0.35)
-      .sort((left, right) => right.score - left.score)
-      .slice(0, 5)
-      .map(({ track, score }) => ({
-        title: track.trackName,
-        artist: track.artistName,
-        album: track.albumName || "",
-        duration: Number.isFinite(track.duration) ? track.duration : null,
-        matchPercent: Math.round(score * 100),
-      }));
+    const results = await searchLrclib(params);
+    lrclibAvailable = true;
 
-    const providerUrl = `https://www.musixmatch.com/search/${encodeURIComponent(
-      `${artist.trim()} ${songTitle.trim()}`,
-    )}`;
+    const ranked = results
+      .map((track) => ({
+        track,
+        ...rankTrack(track, title, artistName, trackDuration),
+      }))
+      .filter(
+        ({ titleScore, artistScore }) =>
+          titleScore >= 0.35 && artistScore >= 0.35
+      )
+      .sort((a, b) => b.score - a.score);
 
-    return res.json({ tracks: ranked, providerUrl });
+    // Prefer the best matching result that actually has lyrics.
+    lrclibMatch = ranked.find(({ track }) => hasLyrics(track)) ?? null;
+
+    // Preserve your existing metadata-search response field.
+    tracks = ranked.slice(0, 5).map(({ track, score }) => toMetadata(track, score));
   } catch (error) {
-    if (error.name === "TimeoutError" || error.name === "AbortError") {
-      console.error("Song search provider request timed out");
-      return res.status(504).json({ error: "Song search timed out" });
+    console.error("LRCLIB search failed:", error.message);
+    // A rejected query (400) still means the provider is up — it simply has
+    // nothing for that input.
+    if (error.status === 400) lrclibAvailable = true;
+  }
+
+  // --------------------------------------------------
+  // 1b. Title-only fallback: the track name is searched as a field.
+  //     The artist is only used to rank the results, never in the query —
+  //     a wrong artist tag would otherwise make the search return nothing.
+  // --------------------------------------------------
+  if (!lrclibMatch) {
+    try {
+      const fuzzyParams = new URLSearchParams({ track_name: title });
+
+      const results = await searchLrclib(fuzzyParams);
+      lrclibAvailable = true;
+
+      const scored = results
+        .map((track) => ({
+          track,
+          ...rankTrack(track, title, artistName, trackDuration),
+        }))
+        .filter(({ titleScore }) => titleScore >= 0.45)
+        .sort((a, b) => b.score - a.score);
+
+      // An exact title that actually has lyrics wins over a partial match.
+      lrclibMatch =
+        scored.find(
+          ({ track }) =>
+            normalizeText(track.trackName) === normalizeText(title) &&
+            hasLyrics(track)
+        ) ?? scored.find(({ track }) => hasLyrics(track)) ?? null;
+
+      if (tracks.length === 0) {
+        tracks = scored.slice(0, 5).map(({ track, score }) => toMetadata(track, score));
+      }
+    } catch (error) {
+      console.error("LRCLIB title-only search failed:", error.message);
+      if (error.status === 400) lrclibAvailable = true;
+    }
+  }
+
+  if (lrclibMatch) {
+    const track = lrclibMatch.track;
+
+    return res.json({
+      tracks,
+      lyrics:
+        typeof track.plainLyrics === "string" ? track.plainLyrics : null,
+      syncedLyrics:
+        typeof track.syncedLyrics === "string" ? track.syncedLyrics : null,
+      source: "lrclib",
+      providerUrl,
+    });
+  }
+
+  // --------------------------------------------------
+  // 2. Fall back to Lyrics.ovh.
+  // --------------------------------------------------
+  try {
+    const fallback = artistName
+      ? await fetchLyricsOvh(artistName, title)
+      : { status: "not_found", lyrics: null };
+
+    if (fallback.status === "found") {
+      return res.json({
+        tracks,
+        lyrics: fallback.lyrics,
+        syncedLyrics: null,
+        source: "lyrics.ovh",
+        providerUrl,
+      });
     }
 
-    console.error("Failed to search song metadata:", error);
-    return res.status(502).json({ error: "Failed to connect to song search provider" });
+    // The providers answered but do not know this track — that is a normal
+    // "no match", not a server failure.
+    if (lrclibAvailable) {
+      return res.json({
+        tracks,
+        lyrics: null,
+        syncedLyrics: null,
+        source: null,
+        providerUrl,
+      });
+    }
+
+    return res.status(502).json({
+      error: "Lyrics providers are unavailable",
+      tracks: [],
+      lyrics: null,
+      syncedLyrics: null,
+      providerUrl,
+    });
+  } catch (error) {
+    console.error("Lyrics.ovh fallback failed:", error.message);
+
+    if (lrclibAvailable) {
+      return res.json({
+        tracks,
+        lyrics: null,
+        syncedLyrics: null,
+        source: null,
+        providerUrl,
+      });
+    }
+
+    return res.status(502).json({
+      error: "Could not connect to lyrics providers",
+      tracks: [],
+      lyrics: null,
+      syncedLyrics: null,
+      providerUrl,
+    });
   }
 });
-app.listen(port, () => {
-  console.log(`Song search server is running on port ${port}`);
-  console.log(
-    `AudD token configured: ${process.env.AUDD_API_TOKEN?.trim() ? "yes" : "no"}`,
-  );
-});
+app.listen(PORT,async()=>{
+console.log('Server Started on Port ',PORT);
+})
