@@ -412,7 +412,6 @@ app.post(
       const transcription = await groq.audio.transcriptions.create({
         file: fs.createReadStream(filePath),
         model: "whisper-large-v3",
-        language: "ar",
         response_format: "verbose_json",
       });
 
