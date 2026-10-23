@@ -1,11 +1,16 @@
-const express= require('express');
-const cors= require('cors');
-const dotenv =require('dotenv');
-const app =express();
+const express = require("express");
+const cors = require("cors");
+const dotenv = require("dotenv");
+const { Groq } = require("groq-sdk");
 dotenv.config();
-const PORT= process.env.PORT || 3000;
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
 app.use(cors());
 app.use(express.json());
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 function normalizeText(value) {
   return String(value ?? "")
@@ -127,7 +132,7 @@ async function fetchLyricsOvh(artist, title) {
 }
 
 app.post("/lyrics", async (req, res) => {
-  console.log('reached');
+  console.log("reached");
   const { songTitle, artist, duration } = req.body ?? {};
 
   if (typeof songTitle !== "string" || !songTitle.trim()) {
@@ -135,8 +140,6 @@ app.post("/lyrics", async (req, res) => {
   }
 
   const title = songTitle.trim();
-  // The artist is optional: when it is missing the lookup falls back to a
-  // title-only search (useful when the file's artist tag is wrong).
   const artistName = typeof artist === "string" ? artist.trim() : "";
 
   const numericDuration = Number(duration);
@@ -179,22 +182,16 @@ app.post("/lyrics", async (req, res) => {
       )
       .sort((a, b) => b.score - a.score);
 
-    // Prefer the best matching result that actually has lyrics.
     lrclibMatch = ranked.find(({ track }) => hasLyrics(track)) ?? null;
 
-    // Preserve your existing metadata-search response field.
     tracks = ranked.slice(0, 5).map(({ track, score }) => toMetadata(track, score));
   } catch (error) {
     console.error("LRCLIB search failed:", error.message);
-    // A rejected query (400) still means the provider is up — it simply has
-    // nothing for that input.
     if (error.status === 400) lrclibAvailable = true;
   }
 
   // --------------------------------------------------
-  // 1b. Title-only fallback: the track name is searched as a field.
-  //     The artist is only used to rank the results, never in the query —
-  //     a wrong artist tag would otherwise make the search return nothing.
+  // 1b. Title-only fallback.
   // --------------------------------------------------
   if (!lrclibMatch) {
     try {
@@ -211,7 +208,6 @@ app.post("/lyrics", async (req, res) => {
         .filter(({ titleScore }) => titleScore >= 0.45)
         .sort((a, b) => b.score - a.score);
 
-      // An exact title that actually has lyrics wins over a partial match.
       lrclibMatch =
         scored.find(
           ({ track }) =>
@@ -233,8 +229,7 @@ app.post("/lyrics", async (req, res) => {
 
     return res.json({
       tracks,
-      lyrics:
-        typeof track.plainLyrics === "string" ? track.plainLyrics : null,
+      lyrics: typeof track.plainLyrics === "string" ? track.plainLyrics : null,
       syncedLyrics:
         typeof track.syncedLyrics === "string" ? track.syncedLyrics : null,
       source: "lrclib",
@@ -260,8 +255,6 @@ app.post("/lyrics", async (req, res) => {
       });
     }
 
-    // The providers answered but do not know this track — that is a normal
-    // "no match", not a server failure.
     if (lrclibAvailable) {
       return res.json({
         tracks,
@@ -301,6 +294,96 @@ app.post("/lyrics", async (req, res) => {
     });
   }
 });
-app.listen(PORT,async()=>{
-console.log('Server Started on Port ',PORT);
-})
+
+// --------------------------------------------------
+// 3. Groq — generate/fetch lyrics via chat completion.
+// --------------------------------------------------
+app.post("/api/groq-lyrics", async (req, res) => {
+  console.log("reached");
+  const { songTitle, artist } = req.body ?? {};
+
+  if (typeof songTitle !== "string" || !songTitle.trim()) {
+    return res.status(400).json({ error: "songTitle is required" });
+  }
+
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(500).json({
+      error: "Groq API key is not configured on the server",
+      lyrics: null,
+      syncedLyrics: null,
+      source: null,
+    });
+  }
+
+  // If the client disconnects (frontend AbortController fires), stop
+  // processing so the Express request does not hang indefinitely.
+  const abortController = new AbortController();
+  req.on("close", () => {
+    if (req.aborted || res.writableEnded) {
+      abortController.abort();
+    }
+  });
+
+  try {
+    const completion = await groq.chat.completions.create(
+      {
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a precise lyrics assistant. Return ONLY the song lyrics text. " +
+              "Do not add introductions, explanations, disclaimers, or markdown code blocks. " +
+              "If synchronized lyrics (timestamps) are known, return them in LRC format " +
+              "with [mm:ss] or [mm:ss.xx] tags. Otherwise return plain verse/chorus text.",
+          },
+          {
+            role: "user",
+            content: `Provide the lyrics for "${songTitle.trim()}"${
+              artist && artist.trim()
+                ? ` by "${artist.trim()}"`
+                : ""
+            }.`,
+          },
+        ],
+        model: "llama-3.1-8b-instant",
+        temperature: 0.2,
+        max_tokens: 2500,
+      },
+      { signal: abortController.signal }
+    );
+
+    const raw = completion.choices[0]?.message?.content;
+    const lyrics = raw ? raw.trim() : null;
+
+    if (!lyrics) {
+      return res.status(404).json({
+        error: "Groq returned no lyrics",
+        lyrics: null,
+        syncedLyrics: null,
+        source: null,
+      });
+    }
+
+    const isSynced = /\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]/.test(lyrics);
+
+    return res.json({
+      lyrics,
+      syncedLyrics: isSynced ? lyrics : null,
+      source: "groq",
+      providerUrl: null,
+      tracks: [],
+    });
+  } catch (error) {
+    console.error("Groq lyrics error:", error.message);
+    return res.status(500).json({
+      error: "Groq lyrics generation failed: " + error.message,
+      lyrics: null,
+      syncedLyrics: null,
+      source: null,
+    });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log("Server Started on Port", PORT);
+});
