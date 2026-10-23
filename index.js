@@ -2,6 +2,8 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const fs = require("fs");
+const path = require("path");
+const multer = require("multer");
 const { Groq } = require("groq-sdk");
 dotenv.config();
 
@@ -300,11 +302,10 @@ app.post("/lyrics", async (req, res) => {
 // 3. Groq — generate/fetch lyrics via chat completion.
 // --------------------------------------------------
 app.post("/api/groq-lyrics", async (req, res) => {
-  console.log("reached");
   
   // 1. استخراج المتغيرات مرة واحدة بشكل نظيف
   const { songTitle, artist, filePath } = req.body ?? {};
-
+console.log(filePath);
   // 2. التحقق من المدخلات
   if (typeof songTitle !== "string" || !songTitle.trim()) {
     return res.status(400).json({ error: "songTitle is required" });
@@ -376,6 +377,78 @@ app.post("/api/groq-lyrics", async (req, res) => {
     });
   }
 });
+// --------------------------------------------------
+// Groq — upload audio file from mobile and transcribe
+// --------------------------------------------------
+const uploadDir = path.join(__dirname, "temp");
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const safeName = Date.now() + "-" + file.originalname.replace(/\s+/g, "_");
+    cb(null, safeName);
+  },
+});
+const upload = multer({ storage });
+
+app.post(
+  "/api/groq-upload",
+  upload.single("audio"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No audio file uploaded" });
+      }
+
+      if (!process.env.GROQ_API_KEY) {
+        return res.status(500).json({ error: "Groq API key is not configured on the server" });
+      }
+
+      const filePath = req.file.path;
+
+      const transcription = await groq.audio.transcriptions.create({
+        file: fs.createReadStream(filePath),
+        model: "whisper-large-v3",
+        language: "ar",
+        response_format: "verbose_json",
+      });
+
+      const text = transcription.text || null;
+      const segments = transcription.segments || null;
+
+      // حذف الملف المؤقت بعد الانتهاء
+      try {
+        fs.unlinkSync(filePath);
+      } catch (_) {}
+
+      if (!text) {
+        return res.status(404).json({
+          error: "Groq returned no transcription",
+          text: null,
+          segments: null,
+        });
+      }
+
+      return res.json({
+        success: true,
+        serverPath: filePath,
+        text,
+        segments,
+      });
+    } catch (error) {
+      console.error("Groq upload transcription error:", error.message);
+      return res.status(500).json({
+        error: "Audio transcription failed: " + error.message,
+        text: null,
+        segments: null,
+      });
+    }
+  }
+);
+
 app.listen(PORT, () => {
   console.log("Server Started on Port", PORT);
 });
