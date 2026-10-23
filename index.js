@@ -339,7 +339,6 @@ console.log(filePath);
       {
         file: fs.createReadStream(filePath.trim()),
         model: "whisper-large-v3", // النموذج الصحيح للصوت
-        language: "auto", // يفضل تثبيت اللغة العربية لتحسين الدقة واللهجات
         response_format: "verbose_json", // ضروري للحصول على الـ Segments للـ Karaoke
       },
       { signal: abortController.signal }
