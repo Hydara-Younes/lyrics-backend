@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+const fs = require("fs");
 const { Groq } = require("groq-sdk");
 dotenv.config();
 
@@ -300,90 +301,81 @@ app.post("/lyrics", async (req, res) => {
 // --------------------------------------------------
 app.post("/api/groq-lyrics", async (req, res) => {
   console.log("reached");
-  const { songTitle, artist } = req.body ?? {};
+  
+  // 1. استخراج المتغيرات مرة واحدة بشكل نظيف
+  const { songTitle, artist, filePath } = req.body ?? {};
 
+  // 2. التحقق من المدخلات
   if (typeof songTitle !== "string" || !songTitle.trim()) {
     return res.status(400).json({ error: "songTitle is required" });
   }
 
+  if (typeof filePath !== "string" || !filePath.trim()) {
+    return res.status(400).json({ error: "filePath is required" });
+  }
+
+  // 3. التحقق من المفتاح مرة واحدة
   if (!process.env.GROQ_API_KEY) {
     return res.status(500).json({
       error: "Groq API key is not configured on the server",
-      lyrics: null,
-      syncedLyrics: null,
-      source: null,
+      text: null,
+      segments: null,
     });
   }
 
-  // If the client disconnects (frontend AbortController fires), stop
-  // processing so the Express request does not hang indefinitely.
+  // 4. التعامل مع إلغاء الطلب من العميل (AbortController)
   const abortController = new AbortController();
+
   req.on("close", () => {
-    if (req.aborted || res.writableEnded) {
+    if (!res.writableEnded) {
       abortController.abort();
     }
   });
 
   try {
-    const completion = await groq.chat.completions.create(
+    // 5. استدعاء نموذج Whisper الصحيح مع إرسال الـ signal
+    const transcription = await groq.audio.transcriptions.create(
       {
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a precise lyrics assistant. Return ONLY the song lyrics text. " +
-              "Do not add introductions, explanations, disclaimers, or markdown code blocks. " +
-              "If synchronized lyrics (timestamps) are known, return them in LRC format " +
-              "with [mm:ss] or [mm:ss.xx] tags. Otherwise return plain verse/chorus text.",
-          },
-          {
-            role: "user",
-            content: `Provide the lyrics for "${songTitle.trim()}"${
-              artist && artist.trim()
-                ? ` by "${artist.trim()}"`
-                : ""
-            }.`,
-          },
-        ],
-        model: "llama-3.1-8b-instant",
-        temperature: 0.2,
-        max_tokens: 2500,
+        file: fs.createReadStream(filePath.trim()),
+        model: "whisper-large-v3", // النموذج الصحيح للصوت
+        language: "ar", // يفضل تثبيت اللغة العربية لتحسين الدقة واللهجات
+        response_format: "verbose_json", // ضروري للحصول على الـ Segments للـ Karaoke
       },
       { signal: abortController.signal }
     );
 
-    const raw = completion.choices[0]?.message?.content;
-    const lyrics = raw ? raw.trim() : null;
+    const text = transcription.text || null;
+    const segments = transcription.segments || null;
 
-    if (!lyrics) {
+    if (!text) {
       return res.status(404).json({
-        error: "Groq returned no lyrics",
-        lyrics: null,
-        syncedLyrics: null,
-        source: null,
+        error: "Groq returned no transcription",
+        text: null,
+        segments: null,
       });
     }
 
-    const isSynced = /\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]/.test(lyrics);
-
     return res.json({
-      lyrics,
-      syncedLyrics: isSynced ? lyrics : null,
-      source: "groq",
-      providerUrl: null,
-      tracks: [],
+      success: true,
+      text,
+      segments,
     });
   } catch (error) {
-    console.error("Groq lyrics error:", error.message);
+    console.error("Groq transcription error:", error.message);
+    
+    // التعامل مع خطأ الإلغاء بشكل خاص لتفادي إرسال Response مرتين
+    if (error.name === 'AbortError' || abortController.signal.aborted) {
+      console.log("Request was aborted by the client.");
+      return; 
+    }
+
     return res.status(500).json({
-      error: "Groq lyrics generation failed: " + error.message,
-      lyrics: null,
-      syncedLyrics: null,
-      source: null,
+      error: "Audio transcription failed: " + error.message,
+      text: null,
+      segments: null,
     });
   }
 });
-
 app.listen(PORT, () => {
   console.log("Server Started on Port", PORT);
 });
